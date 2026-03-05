@@ -12,11 +12,15 @@ import json
 import logging
 import os
 import re
+import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
 import requests
 from requests import HTTPError
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ---------------------------------------------------------------------
 # CONFIG
@@ -25,6 +29,27 @@ CALLRAIL_API_ROOT = "https://api.callrail.com/v3"
 OPENAI_ENDPOINT = "https://api.openai.com/v1/responses"
 OPENAI_MODEL = "gpt-4.1-mini"
 DEFAULT_WEBHOOK_URL = "https://hook.us1.make.com/rjv4nblrc6c2566pn2fg3geo1sltkvla"
+
+# ---------------------------------------------------------------------
+# HTTP SESSION FACTORY
+# ---------------------------------------------------------------------
+def _make_session(retries: int = 4, backoff_factor: float = 0.5) -> requests.Session:
+    """Return a Session with automatic retry on transient errors."""
+    retry = Retry(
+        total=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist={429, 500, 502, 503, 504},
+        allowed_methods={"GET", "POST"},
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+# Shared session for all outbound requests
+_SESSION = _make_session()
 
 # ---------------------------------------------------------------------
 # HTML UTILS
@@ -57,7 +82,7 @@ class CallRailClient:
         self.logger = logger
 
     def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        r = requests.get(f"{self.base}{path}", headers=self.headers, params=params, timeout=30)
+        r = _SESSION.get(f"{self.base}{path}", headers=self.headers, params=params, timeout=30)
         try:
             r.raise_for_status()
         except HTTPError:
@@ -85,7 +110,7 @@ def list_accessible_accounts(api_key: str, logger: logging.Logger) -> Dict[str, 
     accounts: List[Dict[str, Any]] = []
     agencies: List[Dict[str, Any]] = []
     while True:
-        r = requests.get(f"{CALLRAIL_API_ROOT}/a", headers=headers, params=params, timeout=30)
+        r = _SESSION.get(f"{CALLRAIL_API_ROOT}/a", headers=headers, params=params, timeout=30)
         try:
             r.raise_for_status()
         except HTTPError:
@@ -146,18 +171,37 @@ def summarize_numbers_from_trackers(trackers: List[Dict[str, Any]]) -> Dict[str,
         "toll_free_numbers": toll_free_count,
     }
 
-def fetch_tracker_details(client: CallRailClient, trackers: List[Dict[str, Any]], logger: logging.Logger) -> List[Dict[str, Any]]:
-    details = []
-    for tracker in trackers:
+def fetch_tracker_details(
+    client: CallRailClient,
+    trackers: List[Dict[str, Any]],
+    logger: logging.Logger,
+    max_workers: int = 10,
+) -> List[Dict[str, Any]]:
+    """Fetch per-tracker detail payloads in parallel."""
+    if not trackers:
+        return []
+
+    results: Dict[str, Dict[str, Any]] = {}
+
+    def _fetch(tracker: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+        tid = tracker["id"]
         try:
-            detail = client.get(f"/trackers/{tracker['id']}.json")
+            detail = client.get(f"/trackers/{tid}.json")
             if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("Tracker %s payload:\n%s", tracker["id"], json.dumps(detail, indent=2))
-            details.append(detail)
+                logger.debug("Tracker %s payload:\n%s", tid, json.dumps(detail, indent=2))
+            return tid, detail
         except Exception:
-            logger.warning("Could not fetch detail for tracker %s", tracker["id"])
-            details.append(tracker)
-    return details
+            logger.warning("Could not fetch detail for tracker %s", tid)
+            return tid, tracker
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(trackers))) as pool:
+        futures = {pool.submit(_fetch, t): t for t in trackers}
+        for future in as_completed(futures):
+            tid, detail = future.result()
+            results[tid] = detail
+
+    # Preserve original order
+    return [results[t["id"]] for t in trackers]
 
 # ---------------------------------------------------------------------
 # LLM PROMPT
@@ -245,7 +289,7 @@ Focus on:
 """
 
 def llm_summary(api_key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    r = requests.post(
+    r = _SESSION.post(
         OPENAI_ENDPOINT,
         headers={
             "Authorization": f"Bearer {api_key}",
@@ -502,10 +546,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--api-key", default=os.getenv("CALLRAIL_API_KEY"))
     parser.add_argument("--openai-api-key", default=os.getenv("OPENAI_API_KEY"))
+    parser.add_argument("--webhook-url", default=os.getenv("MAKE_WEBHOOK_URL", DEFAULT_WEBHOOK_URL))
+    parser.add_argument("--max-workers", type=int, default=10,
+                        help="Max parallel threads for tracker detail fetching (default: 10)")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
-    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     logger = logging.getLogger("migration")
 
     if not args.api_key:
@@ -547,7 +597,7 @@ def main():
 
         for company in companies:
             trackers = client.paginate("/trackers.json", "trackers", {"company_id": company["id"], "per_page": 250})
-            detailed_trackers = fetch_tracker_details(client, trackers, logger)
+            detailed_trackers = fetch_tracker_details(client, trackers, logger, max_workers=args.max_workers)
             tracker_lookup = {t["id"]: t for t in detailed_trackers}
             integrations = client.paginate("/integrations.json", "integrations", {"company_id": company["id"], "per_page": 250})
 
@@ -591,8 +641,8 @@ def main():
 
     subject = f"CTM Migration Packet {len(overall_sections)} CallRail Account(s) –"
 
-    requests.post(
-        DEFAULT_WEBHOOK_URL,
+    _SESSION.post(
+        args.webhook_url,
         json={
             "subject": subject,
             "html": html,
